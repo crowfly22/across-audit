@@ -1,0 +1,171 @@
+name: Anchor Build (svm-spoke)
+
+# Purpose: build the SVM programs (svm-spoke + multicall-handler) on a GitHub-hosted
+# runner so we don't need a local Solana/Anchor toolchain. Produces the program
+# .so binaries + IDL + TS types as downloadable artifacts for PoC work against
+# solana-test-validator.
+#
+# Manual trigger only — this is not part of upstream CI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      is_test:
+        description: "Build with the `test` cargo feature (adds test-only instructions)"
+        type: boolean
+        default: true
+      programs:
+        description: "Space separated program dirs to build (default: svm-spoke multicall-handler)"
+        type: string
+        default: "svm-spoke multicall-handler"
+  push:
+    paths:
+      - ".github/workflows/anchor-build.yml"
+
+env:
+  NODE_VERSION: "22.23.4"
+  # Pinned to match Cargo.lock (solana-program 2.2.1) and programs/*/Cargo.toml (anchor-lang 0.31.1).
+  SOLANA_VERSION: "2.1.21"
+  ANCHOR_VERSION: "0.31.1"
+  RUST_TOOLCHAIN: "1.84.1"
+
+jobs:
+  build-svm:
+    name: Build SVM programs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          echo "=== before ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          echo "=== after ==="
+          df -h /
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: yarn
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "true"
+          shared-key: anchor-build
+
+      - name: Install Solana CLI
+        run: |
+          set -euo pipefail
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_VERSION}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor CLI (avm)
+        run: |
+          set -euo pipefail
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          avm install "${ANCHOR_VERSION}"
+          avm use "${ANCHOR_VERSION}"
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$HOME/.avm/bin:$PATH"
+          solana --version
+          anchor --version
+          rustc --version
+          cargo --version
+          node --version
+          yarn --version
+
+      - name: Install JS dependencies
+        run: yarn install --frozen-lockfile --ignore-optional
+
+      - name: Prepare Solana keypair
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/solana
+          # Use the repo's localnet wallet if present, otherwise generate a throwaway.
+          if [ -f test/svm/keys/localnet-wallet.json ]; then
+            cp test/svm/keys/localnet-wallet.json ~/.config/solana/id.json
+          else
+            solana-keygen new --no-bip39-passphrase --silent --outfile ~/.config/solana/id.json
+          fi
+          solana config set --url localhost
+
+      - name: Anchor build
+        env:
+          IS_TEST: ${{ inputs.is_test }}
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$HOME/.avm/bin:$PATH"
+          CARGO_OPTS=""
+          if [ "${IS_TEST}" = "true" ]; then
+            CARGO_OPTS="--features test"
+            echo "Building WITH test feature"
+          fi
+          for prog in ${{ inputs.programs || 'svm-spoke multicall-handler' }}; do
+            prog_name="${prog//-/_}"
+            echo "=== anchor build --program-name ${prog_name} ==="
+            anchor build --program-name "${prog_name}" -- $CARGO_OPTS
+          done
+          echo "=== build outputs ==="
+          ls -la target/deploy/ || true
+
+      - name: Build IDL + TS types
+        env:
+          IS_TEST: ${{ inputs.is_test }}
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$HOME/.avm/bin:$PATH"
+          CARGO_OPTS=""
+          if [ "${IS_TEST}" = "true" ]; then CARGO_OPTS="--features test"; fi
+          mkdir -p target/idl target/types
+          for prog in ${{ inputs.programs || 'svm-spoke multicall-handler' }}; do
+            prog_name="${prog//-/_}"
+            echo "=== IDL for ${prog_name} ==="
+            anchor idl build \
+              --program-name "${prog_name}" \
+              --out "target/idl/${prog_name}.json" \
+              --out-ts "target/types/${prog_name}.ts" \
+              -- $CARGO_OPTS || echo "WARN: idl build failed for ${prog_name} (non-fatal)"
+          done
+          ls -la target/idl target/types || true
+
+      - name: Report binary sizes
+        run: |
+          echo "=== program binaries ==="
+          find target/deploy -name "*.so" -exec ls -lh {} \; 2>/dev/null || true
+
+      - name: Upload program binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: svm-programs-${{ inputs.is_test && 'test' || 'release' }}
+          path: |
+            target/deploy/*.so
+            target/deploy/*-keypair.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload IDL and types
+        uses: actions/upload-artifact@v4
+        with:
+          name: svm-idl-${{ inputs.is_test && 'test' || 'release' }}
+          path: |
+            target/idl/**
+            target/types/**
+          if-no-files-found: warn
+          retention-days: 14
